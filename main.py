@@ -7,47 +7,46 @@ from tqdm import tqdm
 from multiprocess.pool import Pool
 
 
-def format_story(sentences):
+def format_sentences(sentences: list[str]) -> str:
     result = ""
     for i, sentence in enumerate(sentences):
         result += f"{i + 1}. {sentence} "
     return result
 
 
-def format_prompt_baseline(story):
-    prompt = "### Given the following two stories, which one is more physically unlikely? Answer as [X, Y] where X is the unlikely story while Y is the unlikely sentence in that story. "
-    story_a = story["stories"][0]
-    story_b = story["stories"][1]
-
-    prompt += ("### Story A: " + format_story(story_a["sentences"]) +
-               "### Story B: " + format_story(story_b["sentences"]))
-    prompt += "### Answer: "
+def format_story(story, prefix) -> str:
+    prompt = ""
+    prompt += f"### {prefix} A: {format_sentences(story["stories"][0]["sentences"])}"
+    prompt += f"### {prefix} B: {format_sentences(story["stories"][1]["sentences"])}"
     return prompt
 
 
-def parse_response(response: str):
-    response = response.split("### Answer: [")
-    if len(response) != 2:
-        print(f"Bad response: {response}")
-        return {}
+def get_conflicting(story) -> list[int]:
+    return [value + 1 for value in [*story["confl_sents"], story["breakpoint"]]]
 
-    response = response[1]
-    return {
-        "story": response[0],
-        "sentence": int(response[3]) - 1,
-        "reason": response[14:]
-    }
 
-def save_list(name, value):
+def get_story_info(story) -> dict:
+    result = {"id": story["example_id"],
+              "correct_story": "B" if story["label"] == 0 else "A",  # The unlikely/implausible story
+              "correct_sentence": get_conflicting(story)}
+    return result
+
+
+def save_list(name: str, value: list[dict]) -> None:
     with open(name, "w") as file:
         for result in value:
             file.write(json.dumps(result) + "\n")
 
-def load_list(name) -> list[dict]:
-    with open(name, "r") as file:
-        return [json.loads(line) for line in file]
 
-def run_raw(command, model, prompt, grammar=None, length=32):
+def load_list(name: str) -> list[dict]:
+    try:
+        with open(name, "r") as file:
+            return [json.loads(line) for line in file]
+    except FileNotFoundError:
+        return []
+
+
+def run_raw(command: str, model: str, prompt: str, grammar=None, length=32) -> (str, float):
     command = [command, "-m", model, "-p", prompt, "-n", str(length), "-t", "1", "-c", "2048"]
 
     if grammar is not None:
@@ -55,89 +54,164 @@ def run_raw(command, model, prompt, grammar=None, length=32):
         command.append(grammar)
 
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
-
     result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
 
     delta_time = after.ru_utime - before.ru_utime
     output = result.stdout.decode("utf-8")
-    return {"response": output, "time": delta_time}
-
-def run_baseline(command, model, prompt):
-
-    result = run_raw(command, model, prompt, "grammar.gbnf")
-    result |= parse_response(result["response"])
-    del result["response"]
-    return result
+    return output, delta_time
 
 
-def run_single(command, model, story):
+def pool_execute(dataset, action):
+    import time
+    before = time.monotonic()
 
-    prompt = format_prompt_baseline(story)
-    result = run_baseline(command, model, prompt)
+    with Pool(processes=20) as pool:
+        iterator = tqdm(pool.imap_unordered(action, dataset, chunksize=1), total=len(dataset))
+        results = list(iterator)
 
-    result["id"] = story["example_id"]
-    result["correct_story"] = "A" if story["label"] == 0 else "B"
-    result["correct_sentence"] = story["confl_sents"]
+    after = time.monotonic()
+    print(f"Pool execution took {after - before} seconds in real time.")
+    return results
 
-    return result
 
-def run_llama(story):
-
+def run_llama(prompt: str, grammar=None, length=32) -> (str, float):
     command = "llama.cpp/build/bin/llama-cli"
     model = "llama.cpp/models/Meta-Llama-3-8B-Instruct.Q8_0.gguf"
-    return run_single(command, model, story)
+    return run_raw(command, model, prompt, grammar, length)
 
 
-def run_bitnet(story):
-
+def run_bitnet(prompt: str, grammar=None, length=32) -> (str, float):
     command = "BitNet/build/bin/llama-cli"
     model = "BitNet/models/Llama3-8B-1.58-100B-tokens/ggml-model-i2_s.gguf"
-    return run_single(command, model, story)
+    return run_raw(command, model, prompt, grammar, length)
 
-def run():
 
+def baseline_run(runner, story):
+    prompt = "### Given the following two stories, which one is more physically unlikely? "
+    prompt += "Answer as [X, Y] where X is the unlikely story while Y is the unlikely sentence in that story. "
+    prompt += format_story(story, "Story") + "### Answer: "
+    output, time = runner(prompt, "grammar/baseline.gbnf", length=32)
+
+    try:
+        response = output.split("### Answer: [")
+        answer = response[1]
+        result = get_story_info(story) | {
+            "story": answer[0],
+            "sentence": int(answer[3]),
+            "reason": answer[14:],
+            "time": time
+        }
+    except Exception:
+        print(f"Bad response: {output}")
+        return {}
+
+    return result
+
+
+def reasoning_run_impl(runner, story, prompt):
+    chain_of_thought = "### If we consider every event step by step, "
+    prompt += format_story(story, "Sequence") + chain_of_thought
+    output, time = runner(prompt, length=64)
+
+    prompt = output + "### Provide your final answer in the format [X, Y] where X is the more unlikely sequence, "
+    prompt += "and Y is the event that contradicts with other events in the sequence. ### Answer: "
+    output, second_time = runner(prompt, "grammar/answer.gbnf", length=8)
+
+    try:
+        response = output.split("### Answer: [")
+        reason = response[0].split(chain_of_thought)
+        answer = response[1]
+        result = get_story_info(story) | {
+            "story": answer[0],
+            "sentence": int(answer[3]),
+            "reason": reason[1],
+            "time": time + second_time
+        }
+    except Exception:
+        print(f"@@@ Bad output: {output}")
+        return {}
+
+    return result
+
+
+def reasoning_run(runner, story):
+    prompt = "### Which of the following two chronological sequences of events is more physically unlikely? "
+    return reasoning_run_impl(runner, story, prompt)
+
+
+def oneshot_run(runner, story, example):
+    example_sentence = get_conflicting(example)
+    example_story = example["stories"][1 - example["label"]]
+
+    prompt = f"### Here is an example of a physically unlikely sequence of events; it is unlikely because "
+    prompt += f"events {example_sentence[0]} and {example_sentence[1]} contradict each other: "
+    prompt += format_sentences(example_story["sentences"])
+    return reasoning_run_impl(runner, story, prompt)
+
+
+def run(arguments):
     dataset = load_dataset("sled-umich/TRIP")
     dataset = dataset["OrderTest"]
-    # dataset = dataset.shuffle()
-    dataset = dataset.take(100)
+    dataset = dataset.shuffle(seed=42)
 
-    prompt = format_prompt_baseline(dataset[0])
-    print(prompt)
-    return
+    example = dataset.skip(len(dataset) - 1)[0]
+    dataset = dataset.take(arguments.samples)
 
-    with Pool(processes=20) as pool:
-        results = list(tqdm(pool.imap_unordered(run_bitnet, dataset, chunksize=1), total=len(dataset)))
+    match arguments.experiment:
+        case "baseline":
+            action_llama = lambda item: baseline_run(run_llama, item)
+            action_bitnet = lambda item: baseline_run(run_bitnet, item)
+        case "reasoning":
+            action_llama = lambda item: reasoning_run(run_llama, item)
+            action_bitnet = lambda item: reasoning_run(run_bitnet, item)
+        case "oneshot":
+            action_llama = lambda item: oneshot_run(run_llama, item, example)
+            action_bitnet = lambda item: oneshot_run(run_bitnet, item, example)
+        case _:
+            print(f"Unknown experiment {arguments.experiment}")
+            return
 
-    save_list("output-bitnet.txt", results)
+    results = pool_execute(dataset, action_llama)
+    save_list(f"{arguments.experiment}-llama.txt", results)
 
-    with Pool(processes=20) as pool:
-        results = list(tqdm(pool.imap_unordered(run_llama, dataset, chunksize=1), total=len(dataset)))
+    results = pool_execute(dataset, action_bitnet)
+    save_list(f"{arguments.experiment}-bitnet.txt", results)
 
-    save_list("output-llama.txt", results)
 
-def evaluate_result(name):
-
+def print_result(name):
     results = load_list(name)
+    if len(results) == 0:
+        return
 
     count_story = list(result["story"] == result["correct_story"] for result in results).count(True)
     count_sentence = list(result["sentence"] in result["correct_sentence"] for result in results).count(True)
 
     import statistics
-    mean = statistics.fmean(float(result["time"]) for result in results)
-    print(f"For {name} there are {count_story} / {len(results)} correct stories and {count_sentence} / {len(results)} correct reasoning sentences with {mean} seconds of average inference time.")
+    average_time = statistics.fmean(float(result["time"]) for result in results)
+    count_total = len(results)
 
-
-def test():
-
-    evaluate_result("output-bitnet.txt")
-    evaluate_result("output-llama.txt")
+    print(name)
+    print(f"Correct story: {count_story} / {count_total} = {count_story / count_total * 100}%")
+    print(f"Correct sentence: {count_sentence} / {count_total} = {count_sentence / count_total * 100}%")
+    print(f"Average inference time: {average_time}")
+    print()
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--experiment", "-e", type=str, required=True)
+    parser.add_argument("--samples", "-s", type=int, default=100)
+    parser.add_argument("--no-run", "-n", action="store_true")
 
-    run()
-    # test()
+    arguments = parser.parse_args()
+    if not arguments.no_run:
+        run(arguments)
+
+    print_result(f"{arguments.experiment}-llama.txt")
+    print_result(f"{arguments.experiment}-bitnet.txt")
+
 
 if __name__ == '__main__':
     main()

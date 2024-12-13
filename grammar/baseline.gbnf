@@ -1,0 +1,8 @@
+root ::= "[" X ", " Y "] Reason: " words*
+
+X ::= "A" | "B"
+Y ::= [1-9]
+
+words ::= letter | symbol
+letter ::= [a-zA-Z]
+symbol ::= [,.' ]
