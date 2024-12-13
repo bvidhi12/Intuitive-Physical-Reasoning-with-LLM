@@ -1,0 +1,6 @@
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = https://github.com/ggerganov/llama.cpp
+[submodule "BitNet"]
+	path = BitNet
+	url = https://github.com/microsoft/BitNet.git
