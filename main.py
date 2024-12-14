@@ -92,6 +92,7 @@ def baseline_run(runner, story):
     prompt += "Answer as [X, Y] where X is the unlikely story while Y is the unlikely sentence in that story. "
     prompt += format_story(story, "Story") + "### Answer: "
     output, time = runner(prompt, "grammar/baseline.gbnf", length=32)
+    print(output)
 
     try:
         response = output.split("### Answer: [")
@@ -103,28 +104,29 @@ def baseline_run(runner, story):
             "time": time
         }
     except Exception:
-        print(f"Bad response: {output}")
+        print(f"@@@ Bad output: {output}")
         return {}
 
     return result
 
 
 def reasoning_run_impl(runner, story, prompt):
-    chain_of_thought = "### If we consider every event step by step, "
+    chain_of_thought = "### If we consider the likelihood of each chronological sequence event by event, "
     prompt += format_story(story, "Sequence") + chain_of_thought
     output, time = runner(prompt, length=64)
 
-    prompt = output + "### Provide your final answer in the format [X, Y] where X is the more unlikely sequence, "
+    prompt = output + "### Provide your final answer in the format X Y where X is the more unlikely sequence, "
     prompt += "and Y is the event that contradicts with other events in the sequence. ### Answer: "
-    output, second_time = runner(prompt, "grammar/answer.gbnf", length=8)
+    output, second_time = runner(prompt, "grammar/answer.gbnf", length=4)
+    print(output)
 
     try:
-        response = output.split("### Answer: [")
+        response = output.split("### Answer: ")
         reason = response[0].split(chain_of_thought)
         answer = response[1]
         result = get_story_info(story) | {
             "story": answer[0],
-            "sentence": int(answer[3]),
+            "sentence": int(answer[2]),
             "reason": reason[1],
             "time": time + second_time
         }
@@ -147,6 +149,7 @@ def oneshot_run(runner, story, example):
     prompt = f"### Here is an example of a physically unlikely sequence of events; it is unlikely because "
     prompt += f"events {example_sentence[0]} and {example_sentence[1]} contradict each other: "
     prompt += format_sentences(example_story["sentences"])
+    prompt += "### Which of the following two chronological sequences of events is more physically unlikely? "
     return reasoning_run_impl(runner, story, prompt)
 
 
@@ -172,11 +175,13 @@ def run(arguments):
             print(f"Unknown experiment {arguments.experiment}")
             return
 
-    results = pool_execute(dataset, action_llama)
-    save_list(f"{arguments.experiment}-llama.txt", results)
+    if not arguments.no_llama:
+        results = pool_execute(dataset, action_llama)
+        save_list(f"{arguments.experiment}-llama.txt", results)
 
-    results = pool_execute(dataset, action_bitnet)
-    save_list(f"{arguments.experiment}-bitnet.txt", results)
+    if not arguments.no_bitnet:
+        results = pool_execute(dataset, action_bitnet)
+        save_list(f"{arguments.experiment}-bitnet.txt", results)
 
 
 def print_result(name):
@@ -201,9 +206,12 @@ def print_result(name):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--experiment", "-e", type=str, required=True)
     parser.add_argument("--samples", "-s", type=int, default=100)
     parser.add_argument("--no-run", "-n", action="store_true")
+    parser.add_argument("--no-llama", action="store_true")
+    parser.add_argument("--no-bitnet", action="store_true")
 
     arguments = parser.parse_args()
     if not arguments.no_run:
